@@ -1,6 +1,6 @@
 /* BEGIN INCLUDE SYSTEM LIBRARIES */
 #include <Arduino.h>          // Arduino Framework
-#include <File_Utility.h>     // File Utility
+// #include <File_Utility.h>  // File Utility (SD card disabled)
 #include <LibAvionics.h>      // Base Avionics Library and Utilities
 #include "SystemFunctions.h"  // Function Declarations
 #include "custom_kalman.h"    // Kalman Quick Table
@@ -10,8 +10,9 @@
 #  include "hal_rtos.h"
 #endif
 
-#include <STM32SD.h>
-#include <STM32Servo.h>
+// #include <STM32SD.h>     // SD card disabled
+// #include <STM32Servo.h>  // Servo disabled: PB6 is now SENSOR_SCL
+#include <vt_lora>          // EBYTE LoRa
 /* END INCLUDE SYSTEM LIBRARIES */
 
 /* BEGIN INCLUDE USER'S IMPLEMENTATIONS */
@@ -28,23 +29,38 @@
 /* BEGIN USER PRIVATE TYPEDEFS, INCLUDES AND MACROS */
 /* END USER PRIVATE TYPEDEFS, INCLUDES AND MACROS */
 
+/* BEGIN BUS INSTANCES */
+// Wire                            // Sensor I2C (SENSOR_SDA, SENSOR_SCL)
+TwoWire        WireGPS(GPS_SDA, GPS_SCL);  // GNSS I2C
+HardwareSerial SerialLoRa(E22_RX, E22_TX);  // E22 UART
+/* END BUS INSTANCES */
+
 /* BEGIN SENSOR INSTANCES */
 SensorIMU *imu[RA_NUM_IMU] = {
-  new IMU_ADXL372(SPI, USER_GPIO_ADXL372_NSS),  // IMU #1
+  new IMU_MPU6050(Wire, MPU6050_ADDR),  // IMU #1
+  new IMU_LIS3DH(Wire, LIS3DH_ADDR),    // IMU #2
 };
-SensorAltimeter *altimeter[RA_NUM_ALTIMETER] = {
-  new Altimeter_BMP581(USER_GPIO_BMP581_NSS),  // Altimeter #1
+Altimeter_BME280 *bme280                      = new Altimeter_BME280(Wire, BME280_ADDR);
+SensorAltimeter  *altimeter[RA_NUM_ALTIMETER] = {
+  bme280,                                 // Altimeter #1
+  new Altimeter_LPS22(Wire, LPS22_ADDR),  // Altimeter #2
 };
-SensorGNSS *gnss[RA_NUM_GNSS] = {
-  nullptr,  // GNSS #1 (No GNSS)
+Hygrometer_AHT20 *hygrometer = new Hygrometer_AHT20(Wire, AHT20_ADDR);
+SensorGNSS       *gnss[RA_NUM_GNSS] = {
+  new GNSS_UBLOX(WireGPS, GNSS_ADDR, 1000ul / RA_INTERVAL_GNSS_READING),  // GNSS #1
 };
 /* END SENSOR INSTANCES */
+
+/* BEGIN COMMUNICATION INSTANCES */
+vt::lora_e22 lora(SerialLoRa, E22_M0, E22_M1);
+/* END COMMUNICATION INSTANCES */
 
 /* BEGIN SENSOR STATUSES */
 struct SensorsHealth {
   SensorStatus imu[RA_NUM_IMU]{};
   SensorStatus altimeter[RA_NUM_ALTIMETER]{};
   SensorStatus gnss[RA_NUM_GNSS]{};
+  SensorStatus hygrometer{};
 } sensors_health;
 /* END SENSOR STATUSES */
 
@@ -62,12 +78,16 @@ struct DataMemory {
   SensorIMU::Data       imu[RA_NUM_IMU];
   SensorAltimeter::Data altimeter[RA_NUM_ALTIMETER];
   SensorGNSS::Data      gnss[RA_NUM_GNSS];
+  SensorEnvData         bme280;
+  SensorEnvData         hygrometer;
 } data;
 String sd_buf;
+String tx_buf;
+String debug_buf;
 /* END DATA MEMORY */
 
 /* BEGIN SD CARD */
-FsUtil fs_sd;
+// FsUtil fs_sd;  // SD card disabled
 /* END SD CARD */
 
 /* BEGIN FILTERS */
@@ -77,14 +97,16 @@ Filter1T                     filter_alt;
 /* END FILTERS */
 
 /* BEGIN ACTUATORS */
-STM32ServoList servos(TIMER_SERVO);
-float          pos_a = RA_SERVO_A_LOCK;
-float          pos_b = 90;
+// Servo disabled: USER_GPIO_SERVO_A (PB6) is now SENSOR_SCL
+// STM32ServoList servos(TIMER_SERVO);
+float pos_a = RA_SERVO_A_LOCK;
+float pos_b = 90;
 /* END ACTUATORS */
 
 /* BEGIN USER PRIVATE VARIABLES */
-hal::rtos::mutex_t mtx_sdio;
-hal::rtos::mutex_t mtx_spi;
+// hal::rtos::mutex_t mtx_sdio;  // SD card disabled
+hal::rtos::mutex_t mtx_i2c;      // Sensor I2C bus (Wire)
+hal::rtos::mutex_t mtx_i2c_gps;  // GNSS I2C bus (WireGPS)
 hal::rtos::mutex_t mtx_cdc;
 /* END USER PRIVATE VARIABLES */
 
@@ -115,6 +137,14 @@ uint32_t LoggerInterval() {
       return RA_SDLOGGER_INTERVAL_IDLE;
   }
 }
+void PrintInitStatus(const char *name, const SensorStatus status) {
+  if constexpr (RA_USB_DEBUG_ENABLED) {
+    Serial.print("[Init] ");
+    Serial.print(name);
+    Serial.print(": ");
+    Serial.println(status == SensorStatus::SENSOR_OK ? "OK" : "FAILED");
+  }
+}
 /* END USER PRIVATE FUNCTIONS */
 
 /* BEGIN USER SETUP */
@@ -125,27 +155,71 @@ void UserSetupGPIO() {
 }
 
 void UserSetupActuator() {
-  servos.attach(USER_GPIO_SERVO_A, RA_SERVO_MIN, RA_SERVO_MAX, RA_SERVO_MAX);
+  // Servo disabled: USER_GPIO_SERVO_A (PB6) is now SENSOR_SCL
+  // servos.attach(USER_GPIO_SERVO_A, RA_SERVO_MIN, RA_SERVO_MAX, RA_SERVO_MAX);
 }
 
 void UserSetupCDC() {
   if constexpr (RA_USB_DEBUG_ENABLED) {
     Serial.begin();
+
+    // Wait (bounded) for the USB host so the init messages are not lost
+    const uint32_t t0 = millis();
+    while (!Serial && millis() - t0 < RA_USB_WAIT_TIMEOUT_MS) {
+    }
   }
 }
 
-void UserSetupSPI() {
-  SPI.setMOSI(USER_GPIO_SPI1_MOSI);
-  SPI.setMISO(USER_GPIO_SPI1_MISO);
-  SPI.setSCLK(USER_GPIO_SPI1_SCK);
-  SPI.begin();
+void UserSetupI2C() {
+  Wire.setSDA(SENSOR_SDA);
+  Wire.setSCL(SENSOR_SCL);
+  Wire.begin();
+  Wire.setClock(SENSOR_I2C_SPEED);
+
+  // Release the GNSS from reset (active low)
+  pinMode(GPS_RESET, OUTPUT);
+  digitalWrite(GPS_RESET, HIGH);
+
+  WireGPS.begin();
+  WireGPS.setClock(GPS_I2C_SPEED);
+}
+
+void UserSetupUSART() {
+  // Same sequence as the vt-lora-ebyte example: config -> set_param -> query_param -> begin
+  Serial.println("[LoRa] Beginning configuration mode...");
+  lora.config();
+  Serial.println("[LoRa] Entered configuration mode!");
+
+  lora.set_param(E22_ADDRESS,
+                 RA_LORA_NET_ID,
+                 E22_BAUDRATE,
+                 vt::LoRaParity::PARITY_8N1,
+                 RA_LORA_AIR_DATA_RATE,
+                 E22_CHANNEL,
+                 RA_LORA_PACKET_LENGTH,
+                 /*save_params*/ true);
+
+  // REG3: enable fixed-point transmission (the library leaves it transparent)
+  constexpr uint8_t E22_REG3_FIXED_TX = 0x40;
+  const uint8_t     cmd_reg3[]        = {0xC0, 0x06, 0x01, E22_REG3_FIXED_TX};
+  lora.hw_serial().write(cmd_reg3, sizeof(cmd_reg3));
+  delay(50);
+
+  Serial.print("[LoRa] Module replies: ");
+  // lora.query_param();  // Prints every byte the module sent back; blocks if it sent nothing
+  Serial.println();
+
+  Serial.println("[LoRa] Done config!");
+
+  // Normal (transmit) mode
+  lora.begin(E22_BAUDRATE);
 }
 /* END USER SETUP */
 
 /* BEGIN USER THREADS */
 void CB_ReadIMU(void *) {
   hal::rtos::interval_loop(RA_INTERVAL_IMU_READING, [&]() -> void {
-    mtx_spi.exec(ReadIMU);
+    mtx_i2c.exec(ReadIMU);
 
     const double &ax = data.imu[0].acc_x;
     const double &ay = data.imu[0].acc_y;
@@ -164,7 +238,7 @@ void CB_ReadIMU(void *) {
 
 void CB_ReadAltimeter(void *) {
   hal::rtos::interval_loop(RA_INTERVAL_ALTIMETER_READING, [&]() -> void {
-    mtx_spi.exec(ReadAltimeter);
+    mtx_i2c.exec(ReadAltimeter);
 
     // Update KF with measurement
     filter_alt.kf.update({data.altimeter[0].altitude_m});
@@ -175,6 +249,18 @@ void CB_ReadAltimeter(void *) {
     // Update apogee
     if (alt_agl > apogee_raw)
       apogee_raw = alt_agl;
+  });
+}
+
+void CB_ReadHygrometer(void *) {
+  hal::rtos::interval_loop(RA_INTERVAL_HYGROMETER_READING, [&]() -> void {
+    mtx_i2c.exec(ReadHygrometer);
+  });
+}
+
+void CB_ReadGNSS(void *) {
+  hal::rtos::interval_loop(RA_INTERVAL_GNSS_READING, [&]() -> void {
+    mtx_i2c_gps.exec(ReadGNSS);
   });
 }
 
@@ -215,7 +301,7 @@ void CB_ConstructData(void *) {
     sd_buf = "";
     csv_stream_lf(sd_buf)
       << "MFC"
-      << seq_no++
+      << seq_no
       << millis()
       << state_string(fsm.state())
 
@@ -233,13 +319,83 @@ void CB_ConstructData(void *) {
       << alt_ref
       << apogee_raw
 
-      << pos_a  // Servo A
-      << ReadCPUTemp()
+      << data.imu[1].acc_x
+      << data.imu[1].acc_y
+      << data.imu[1].acc_z
+      << data.imu[0].gyr_x
+      << data.imu[0].gyr_y
+      << data.imu[0].gyr_z
+      << data.altimeter[1].altitude_m
+      << data.altimeter[1].pressure_hpa
+      << data.hygrometer.temperature_c
+      << data.hygrometer.humidity_rh
+      << data.gnss[0].timestamp_epoch
+      << data.gnss[0].siv
+      << String(data.gnss[0].latitude, 7)
+      << String(data.gnss[0].longitude, 7)
+      << data.gnss[0].altitude_msl
       //
       ;
   });
 }
 
+void CB_Telemetry(void *) {
+  tx_buf.reserve(RA_LORA_PACKET_LENGTH);
+
+  hal::rtos::interval_loop(TELEMETRY_PERIOD_MS, [&]() -> void {
+    tx_buf = "";
+    csv_stream_lf(tx_buf)
+      << TEAM_ID
+      << seq_no
+      << millis()
+      << state_string(fsm.state())
+
+      << filter_alt.kf.state_vector()[0]  // POS
+      << filter_alt.kf.state_vector()[1]  // VEL
+      << data.altimeter[0].pressure_hpa   // BME280
+      << data.bme280.temperature_c
+      << data.bme280.humidity_rh
+      << data.altimeter[1].pressure_hpa   // LPS22
+
+      << data.imu[0].acc_x  // MPU6050
+      << data.imu[0].acc_y
+      << data.imu[0].acc_z
+      << data.imu[0].gyr_x
+      << data.imu[0].gyr_y
+      << data.imu[0].gyr_z
+      << data.imu[1].acc_x  // LIS3DH
+      << data.imu[1].acc_y
+      << data.imu[1].acc_z
+
+      << data.hygrometer.temperature_c  // AHT20
+      << data.hygrometer.humidity_rh
+
+      << data.gnss[0].siv
+      << String(data.gnss[0].latitude, 7)
+      << String(data.gnss[0].longitude, 7)
+      << data.gnss[0].altitude_msl
+      //
+      ;
+
+    // Fixed-point transmission header: target address + channel
+    const uint8_t header[] = {
+      static_cast<uint8_t>(E22_DEST_ADDRESS >> 8),
+      static_cast<uint8_t>(E22_DEST_ADDRESS & 0xFF),
+      static_cast<uint8_t>(E22_DEST_CHANNEL),
+    };
+    const size_t payload_len = std::min<size_t>(tx_buf.length(), RA_LORA_PACKET_LENGTH - sizeof(header));
+
+    size_t written = lora.hw_serial().write(header, sizeof(header));
+    written += lora.hw_serial().write(reinterpret_cast<const uint8_t *>(tx_buf.c_str()), payload_len);
+    lora.hw_serial().flush();  // Wait until the whole packet has left the UART
+
+    // Count the packet only once it has been handed to the module
+    if (written == sizeof(header) + payload_len)
+      ++seq_no;
+  });
+}
+
+/*
 void CB_SDLogger(void *) {
   hal::rtos::interval_loop(LoggerInterval(), LoggerInterval, [&]() -> void {
     mtx_sdio.exec([&]() -> void {
@@ -255,11 +411,63 @@ void CB_SDSave(void *) {
     });
   });
 }
+*/
 
 void CB_DebugLogger(void *) {
-  hal::rtos::interval_loop(100ul, [&]() -> void {
+  debug_buf.reserve(1024);
+
+  const auto line = [](const char *label, const double value, const char *unit, const unsigned digits = 2) -> void {
+    debug_buf += label;
+    debug_buf += ": ";
+    debug_buf += String(value, digits);
+    debug_buf += unit;
+    debug_buf += "\r\n";
+  };
+
+  hal::rtos::interval_loop(RA_INTERVAL_DEBUG_PRINT, [&]() -> void {
+    debug_buf = "";
+    debug_buf += "========================================\r\n";
+    debug_buf += "Packets sent: ";
+    debug_buf += seq_no;
+    debug_buf += " | Time: ";
+    debug_buf += millis();
+    debug_buf += " ms | State: ";
+    debug_buf += state_string(fsm.state());
+    debug_buf += "\r\n";
+
+    line("Temperature bme", data.bme280.temperature_c, " C");
+    line("Humidity bme", data.bme280.humidity_rh, " %");
+    line("Pressure bme", data.altimeter[0].pressure_hpa, " hPa");
+    line("Altitude bme", data.altimeter[0].altitude_m, " m");
+
+    line("Pressure lps22", data.altimeter[1].pressure_hpa, " hPa");
+    line("Altitude lps22", data.altimeter[1].altitude_m, " m");
+
+    line("Temperature aht20", data.hygrometer.temperature_c, " C");
+    line("Humidity aht20", data.hygrometer.humidity_rh, " %");
+
+    line("Accel X mpu6050", data.imu[0].acc_x, " g", 3);
+    line("Accel Y mpu6050", data.imu[0].acc_y, " g", 3);
+    line("Accel Z mpu6050", data.imu[0].acc_z, " g", 3);
+    line("Gyro X mpu6050", data.imu[0].gyr_x, " rad/s", 3);
+    line("Gyro Y mpu6050", data.imu[0].gyr_y, " rad/s", 3);
+    line("Gyro Z mpu6050", data.imu[0].gyr_z, " rad/s", 3);
+
+    line("Accel X lis3dh", data.imu[1].acc_x, " g", 3);
+    line("Accel Y lis3dh", data.imu[1].acc_y, " g", 3);
+    line("Accel Z lis3dh", data.imu[1].acc_z, " g", 3);
+
+    line("Satellites gnss", data.gnss[0].siv, "", 0);
+    line("Latitude gnss", data.gnss[0].latitude, " deg", 7);
+    line("Longitude gnss", data.gnss[0].longitude, " deg", 7);
+    line("Altitude gnss", data.gnss[0].altitude_msl, " m");
+
+    line("Altitude filtered", filter_alt.kf.state_vector()[0], " m");
+    line("Velocity filtered", filter_alt.kf.state_vector()[1], " m/s");
+    line("Altitude AGL", alt_agl, " m");
+
     mtx_cdc.exec([&]() -> void {
-      Serial.print(sd_buf);
+      Serial.print(debug_buf);
     });
   });
 }
@@ -277,6 +485,8 @@ void UserThreads() {
 
   hal::rtos::scheduler.create(CB_ReadIMU, {.name = "CB_ReadIMU", .stack_size = 8192, .priority = osPriorityHigh});
   hal::rtos::scheduler.create(CB_ReadAltimeter, {.name = "CB_ReadAltimeter", .stack_size = 8192, .priority = osPriorityHigh});
+  hal::rtos::scheduler.create(CB_ReadHygrometer, {.name = "CB_ReadHygrometer", .stack_size = 4096, .priority = osPriorityAboveNormal});
+  hal::rtos::scheduler.create(CB_ReadGNSS, {.name = "CB_ReadGNSS", .stack_size = 8192, .priority = osPriorityAboveNormal});
 
   if constexpr (RA_RETAIN_DEPLOYMENT_ENABLED)
     hal::rtos::scheduler.create(CB_RetainDeployment, {.name = "CB_RetainDeployment", .stack_size = 4096, .priority = osPriorityHigh});
@@ -285,22 +495,24 @@ void UserThreads() {
     hal::rtos::scheduler.create(CB_AutoZeroAlt, {.name = "CB_AutoZeroAlt", .stack_size = 4096, .priority = osPriorityHigh});
 
   hal::rtos::scheduler.create(CB_ConstructData, {.name = "CB_ConstructData", .stack_size = 8192, .priority = osPriorityNormal});
-  hal::rtos::scheduler.create(CB_SDLogger, {.name = "CB_SDLogger", .stack_size = 8192, .priority = osPriorityNormal});
+  hal::rtos::scheduler.create(CB_Telemetry, {.name = "CB_Telemetry", .stack_size = 8192, .priority = osPriorityNormal});
+  // hal::rtos::scheduler.create(CB_SDLogger, {.name = "CB_SDLogger", .stack_size = 8192, .priority = osPriorityNormal});
 
   if constexpr (RA_USB_DEBUG_ENABLED)
     hal::rtos::scheduler.create(CB_DebugLogger, {.name = "CB_DebugLogger", .stack_size = 8192, .priority = osPriorityBelowNormal});
 
-  hal::rtos::scheduler.create(CB_SDSave, {.name = "CB_SDSave", .stack_size = 8192, .priority = osPriorityLow});
+  // hal::rtos::scheduler.create(CB_SDSave, {.name = "CB_SDSave", .stack_size = 8192, .priority = osPriorityLow});
 }
 
 void setup() {
   /* BEGIN STORAGES SETUP */
-  SD.setDx(USER_GPIO_SDIO_DAT0, USER_GPIO_SDIO_DAT1, USER_GPIO_SDIO_DAT2, USER_GPIO_SDIO_DAT3);
-  SD.setCMD(USER_GPIO_SDIO_CMD);
-  SD.setCK(USER_GPIO_SDIO_CK);
-  SD.begin();
-  fs_sd.find_file_name(RA_FILE_NAME, RA_FILE_EXT);
-  fs_sd.open_one<FsMode::WRITE>();
+  // SD card disabled
+  // SD.setDx(USER_GPIO_SDIO_DAT0, USER_GPIO_SDIO_DAT1, USER_GPIO_SDIO_DAT2, USER_GPIO_SDIO_DAT3);
+  // SD.setCMD(USER_GPIO_SDIO_CMD);
+  // SD.setCK(USER_GPIO_SDIO_CK);
+  // SD.begin();
+  // fs_sd.find_file_name(RA_FILE_NAME, RA_FILE_EXT);
+  // fs_sd.open_one<FsMode::WRITE>();
   sd_buf.reserve(1024);
   /* END STORAGES SETUP */
 
@@ -310,7 +522,6 @@ void setup() {
   UserSetupCDC();
   UserSetupUSART();
   UserSetupI2C();
-  UserSetupSPI();
   /* END GPIO AND INTERFACES SETUP */
 
   /* BEGIN FILTERS SETUP */
@@ -328,6 +539,8 @@ void setup() {
     else
       sensors_health.imu[i] = SensorStatus::SENSOR_ERR;
   }
+  PrintInitStatus("MPU6050", sensors_health.imu[0]);
+  PrintInitStatus("LIS3DH", sensors_health.imu[1]);
 
   // Altimeter
   for (size_t i = 0; i < RA_NUM_ALTIMETER; ++i) {
@@ -338,6 +551,8 @@ void setup() {
     else
       sensors_health.altimeter[i] = SensorStatus::SENSOR_ERR;
   }
+  PrintInitStatus("BME280", sensors_health.altimeter[0]);
+  PrintInitStatus("LPS22", sensors_health.altimeter[1]);
 
   // GNSS
   for (size_t i = 0; i < RA_NUM_GNSS; ++i) {
@@ -348,6 +563,16 @@ void setup() {
     else
       sensors_health.gnss[i] = SensorStatus::SENSOR_ERR;
   }
+  PrintInitStatus("GNSS", sensors_health.gnss[0]);
+
+  // Hygrometer
+  if (!hygrometer)
+    sensors_health.hygrometer = SensorStatus::SENSOR_NO;
+  else if (hygrometer->begin())
+    sensors_health.hygrometer = SensorStatus::SENSOR_OK;
+  else
+    sensors_health.hygrometer = SensorStatus::SENSOR_ERR;
+  PrintInitStatus("AHT20", sensors_health.hygrometer);
 
   /* END SENSORS SETUP */
 
@@ -559,6 +784,12 @@ void ReadAltimeter() {
     data.altimeter[i].pressure_hpa = altimeter[i]->pressure_hpa();
     data.altimeter[i].altitude_m   = altimeter[i]->altitude_m();
   }
+
+  // BME280 also measures temperature and humidity
+  if (sensors_health.altimeter[0] == SensorStatus::SENSOR_OK) {
+    data.bme280.temperature_c = bme280->temperature_c();
+    data.bme280.humidity_rh   = bme280->humidity_rh();
+  }
 }
 
 void ReadGNSS() {
@@ -574,11 +805,19 @@ void ReadGNSS() {
   }
 }
 
+void ReadHygrometer() {
+  if (sensors_health.hygrometer != SensorStatus::SENSOR_OK ||
+      !hygrometer->read())
+    return;
+  data.hygrometer.temperature_c = hygrometer->temperature_c();
+  data.hygrometer.humidity_rh   = hygrometer->humidity_rh();
+}
+
 void ActivateDeployment(const size_t index) {
   switch (index) {
     case 0: {  // Drogue/First Deployment
       pos_a = RA_SERVO_A_RELEASE;
-      servos[0].write(pos_a);
+      // servos[0].write(pos_a);  // Servo disabled
       break;
     }
 
@@ -592,7 +831,7 @@ void ActivateDeployment(const size_t index) {
 }
 
 void RetainDeployment() {
-  servos[0].write(pos_a);
+  // servos[0].write(pos_a);  // Servo disabled
 }
 
 void AutoZeroAlt() {

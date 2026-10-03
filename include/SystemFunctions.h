@@ -9,6 +9,8 @@ extern void ReadAltimeter();
 
 extern void ReadGNSS();
 
+extern void ReadHygrometer();
+
 extern void ActivateDeployment(size_t index);
 
 /**
@@ -20,11 +22,11 @@ extern void AutoZeroAlt();
 
 namespace internal {
   inline int32_t read_vref() {
-    return __LL_ADC_CALC_VREFANALOG_VOLTAGE(analogRead(AVREF), LL_ADC_RESOLUTION_16B);
+    return __LL_ADC_CALC_VREFANALOG_VOLTAGE(analogRead(AVREF), LL_ADC_RESOLUTION_10B);
   }
 
   inline int32_t read_cpu_temp(const int32_t VRef) {
-    return __LL_ADC_CALC_TEMPERATURE(VRef, analogRead(ATEMP), LL_ADC_RESOLUTION_16B);
+    return __LL_ADC_CALC_TEMPERATURE(VRef, analogRead(ATEMP), LL_ADC_RESOLUTION_10B);
   }
 }  // namespace internal
 
