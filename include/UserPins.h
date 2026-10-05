@@ -77,7 +77,7 @@ constexpr uint32_t E22_M1 = PA6;
 // E22 CONFIGURATION
 // ============================================================
 
-constexpr uint16_t E22_ADDRESS = 0x0001;
+constexpr uint16_t E22_ADDRESS = 0xffff;
 constexpr uint8_t  E22_CHANNEL = 0x17;
 
 constexpr uint16_t E22_DEST_ADDRESS = 0x0002;

@@ -1,5 +1,5 @@
 /* BEGIN INCLUDE SYSTEM LIBRARIES */
-#include <Arduino.h>          // Arduino Framework
+#include <Arduino.h>  // Arduino Framework
 // #include <File_Utility.h>  // File Utility (SD card disabled)
 #include <LibAvionics.h>      // Base Avionics Library and Utilities
 #include "SystemFunctions.h"  // Function Declarations
@@ -12,7 +12,7 @@
 
 // #include <STM32SD.h>     // SD card disabled
 // #include <STM32Servo.h>  // Servo disabled: PB6 is now SENSOR_SCL
-#include <vt_lora>          // EBYTE LoRa
+#include <vt_lora>  // EBYTE LoRa
 /* END INCLUDE SYSTEM LIBRARIES */
 
 /* BEGIN INCLUDE USER'S IMPLEMENTATIONS */
@@ -31,7 +31,7 @@
 
 /* BEGIN BUS INSTANCES */
 // Wire                            // Sensor I2C (SENSOR_SDA, SENSOR_SCL)
-TwoWire        WireGPS(GPS_SDA, GPS_SCL);  // GNSS I2C
+TwoWire        WireGPS(GPS_SDA, GPS_SCL);   // GNSS I2C
 HardwareSerial SerialLoRa(E22_RX, E22_TX);  // E22 UART
 /* END BUS INSTANCES */
 
@@ -45,7 +45,7 @@ SensorAltimeter  *altimeter[RA_NUM_ALTIMETER] = {
   bme280,                                 // Altimeter #1
   new Altimeter_LPS22(Wire, LPS22_ADDR),  // Altimeter #2
 };
-Hygrometer_AHT20 *hygrometer = new Hygrometer_AHT20(Wire, AHT20_ADDR);
+Hygrometer_AHT20 *hygrometer        = new Hygrometer_AHT20(Wire, AHT20_ADDR);
 SensorGNSS       *gnss[RA_NUM_GNSS] = {
   new GNSS_UBLOX(WireGPS, GNSS_ADDR, 1000ul / RA_INTERVAL_GNSS_READING),  // GNSS #1
 };
@@ -145,6 +145,43 @@ void PrintInitStatus(const char *name, const SensorStatus status) {
     Serial.println(status == SensorStatus::SENSOR_OK ? "OK" : "FAILED");
   }
 }
+
+// USART2 is alive only while its APB1 clock is on and CR1.UE is set (a dead/ungated USART reads SR=CR1=0)
+bool LoRaUartAlive() {
+  return (RCC->APB1ENR & RCC_APB1ENR_USART2EN) && (USART2->CR1 & USART_CR1_UE);
+}
+
+// Debug: report the E22 UART state at a given point, to find what switches USART2 off
+void LoRaUartProbe(const char *where) {
+  if constexpr (RA_USB_DEBUG_ENABLED) {
+    Serial.print("[LoRa UART] ");
+    Serial.print(where);
+    Serial.print(": clk=");
+    Serial.print((RCC->APB1ENR & RCC_APB1ENR_USART2EN) ? 1 : 0);
+    Serial.print(" SR=0x");
+    Serial.print(USART2->SR, HEX);
+    Serial.print(" CR1=0x");
+    Serial.println(USART2->CR1, HEX);
+  }
+}
+
+// Polled, interrupt-free TX straight into the E22's USART (USART2 on PA2/PA3).
+// HardwareSerial::write() relies on the TX-complete interrupt to drain its 64-byte buffer and spins
+// forever when that stalls; here the task sleeps between bytes and gives up instead of hanging.
+bool LoRaWrite(const uint8_t *buf, const size_t len) {
+  constexpr uint32_t BYTE_TIMEOUT_MS = 50;  // One byte takes ~1 ms at 9600 baud
+
+  for (size_t i = 0; i < len; ++i) {
+    const uint32_t t0 = millis();
+    while (!(USART2->SR & USART_SR_TXE)) {
+      if (millis() - t0 >= BYTE_TIMEOUT_MS)
+        return false;
+      hal::rtos::delay_ms(1);
+    }
+    USART2->DR = buf[i];
+  }
+  return true;
+}
 /* END USER PRIVATE FUNCTIONS */
 
 /* BEGIN USER SETUP */
@@ -186,8 +223,10 @@ void UserSetupI2C() {
 
 void UserSetupUSART() {
   // Same sequence as the vt-lora-ebyte example: config -> set_param -> query_param -> begin
+  delay(1000);
   Serial.println("[LoRa] Beginning configuration mode...");
   lora.config();
+  delay(1000);
   Serial.println("[LoRa] Entered configuration mode!");
 
   lora.set_param(E22_ADDRESS,
@@ -200,19 +239,20 @@ void UserSetupUSART() {
                  /*save_params*/ true);
 
   // REG3: enable fixed-point transmission (the library leaves it transparent)
-  constexpr uint8_t E22_REG3_FIXED_TX = 0x40;
-  const uint8_t     cmd_reg3[]        = {0xC0, 0x06, 0x01, E22_REG3_FIXED_TX};
-  lora.hw_serial().write(cmd_reg3, sizeof(cmd_reg3));
+  // constexpr uint8_t E22_REG3_FIXED_TX = 0x40;
+  // const uint8_t     cmd_reg3[]        = {0xC0, 0x06, 0x01, E22_REG3_FIXED_TX};
+  // lora.hw_serial().write(cmd_reg3, sizeof(cmd_reg3));
   delay(50);
 
   Serial.print("[LoRa] Module replies: ");
-  // lora.query_param();  // Prints every byte the module sent back; blocks if it sent nothing
+  lora.query_param();  // Prints every byte the module sent back; blocks if it sent nothing
   Serial.println();
 
   Serial.println("[LoRa] Done config!");
 
   // Normal (transmit) mode
   lora.begin(E22_BAUDRATE);
+  LoRaUartProbe("after lora.begin");
 }
 /* END USER SETUP */
 
@@ -344,7 +384,7 @@ void CB_Telemetry(void *) {
 
   hal::rtos::interval_loop(TELEMETRY_PERIOD_MS, [&]() -> void {
     tx_buf = "";
-    csv_stream_lf(tx_buf)
+    csv_stream(tx_buf)
       << TEAM_ID
       << seq_no
       << millis()
@@ -355,7 +395,7 @@ void CB_Telemetry(void *) {
       << data.altimeter[0].pressure_hpa   // BME280
       << data.bme280.temperature_c
       << data.bme280.humidity_rh
-      << data.altimeter[1].pressure_hpa   // LPS22
+      << data.altimeter[1].pressure_hpa  // LPS22
 
       << data.imu[0].acc_x  // MPU6050
       << data.imu[0].acc_y
@@ -377,21 +417,39 @@ void CB_Telemetry(void *) {
       //
       ;
 
-    // Fixed-point transmission header: target address + channel
-    const uint8_t header[] = {
-      static_cast<uint8_t>(E22_DEST_ADDRESS >> 8),
-      static_cast<uint8_t>(E22_DEST_ADDRESS & 0xFF),
-      static_cast<uint8_t>(E22_DEST_CHANNEL),
-    };
-    const size_t payload_len = std::min<size_t>(tx_buf.length(), RA_LORA_PACKET_LENGTH - sizeof(header));
+    Serial.println(tx_buf);
+    // Transparent transmission, same bytes as SerialLoRa.println(tx_buf) but without busy-waiting
+    tx_buf += "\r\n";
+    static bool first_tick = true;
+    if (first_tick) {
+      first_tick = false;
+      mtx_cdc.exec([&]() -> void {
+        LoRaUartProbe("first telemetry tick");
+      });
+    }
 
-    size_t written = lora.hw_serial().write(header, sizeof(header));
-    written += lora.hw_serial().write(reinterpret_cast<const uint8_t *>(tx_buf.c_str()), payload_len);
-    lora.hw_serial().flush();  // Wait until the whole packet has left the UART
+    // Something switched USART2 off since setup: bring it back (also restores M0/M1 = normal mode)
+    if (!LoRaUartAlive()) {
+      lora.begin(E22_BAUDRATE);
+      mtx_cdc.exec([&]() -> void {
+        LoRaUartProbe("USART2 was off, re-initialized");
+      });
+    }
 
-    // Count the packet only once it has been handed to the module
-    if (written == sizeof(header) + payload_len)
+    const bool sent = LoRaWrite(reinterpret_cast<const uint8_t *>(tx_buf.c_str()), tx_buf.length());
+    if (sent)
       ++seq_no;
+
+    mtx_cdc.exec([&]() -> void {
+      if (sent) {
+        Serial.println("LORA SENT");
+      } else {
+        Serial.print("LORA TX STALLED, USART2 SR=0x");
+        Serial.print(USART2->SR, HEX);
+        Serial.print(" CR1=0x");
+        Serial.println(USART2->CR1, HEX);
+      }
+    });
   });
 }
 
@@ -494,7 +552,7 @@ void UserThreads() {
   if constexpr (RA_AUTO_ZERO_ALT_ENABLED)
     hal::rtos::scheduler.create(CB_AutoZeroAlt, {.name = "CB_AutoZeroAlt", .stack_size = 4096, .priority = osPriorityHigh});
 
-  hal::rtos::scheduler.create(CB_ConstructData, {.name = "CB_ConstructData", .stack_size = 8192, .priority = osPriorityNormal});
+  hal::rtos::scheduler.create(CB_ConstructData, {.name = "CB_ConstructData", .stack_size = 4096, .priority = osPriorityNormal});
   hal::rtos::scheduler.create(CB_Telemetry, {.name = "CB_Telemetry", .stack_size = 8192, .priority = osPriorityNormal});
   // hal::rtos::scheduler.create(CB_SDLogger, {.name = "CB_SDLogger", .stack_size = 8192, .priority = osPriorityNormal});
 
@@ -522,6 +580,7 @@ void setup() {
   UserSetupCDC();
   UserSetupUSART();
   UserSetupI2C();
+  LoRaUartProbe("after I2C setup");
   /* END GPIO AND INTERFACES SETUP */
 
   /* BEGIN FILTERS SETUP */
@@ -573,6 +632,7 @@ void setup() {
   else
     sensors_health.hygrometer = SensorStatus::SENSOR_ERR;
   PrintInitStatus("AHT20", sensors_health.hygrometer);
+  LoRaUartProbe("after sensors setup");
 
   /* END SENSORS SETUP */
 

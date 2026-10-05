@@ -23,7 +23,7 @@ constexpr size_t RA_NUM_GNSS = 1;  // u-blox (GNSS I2C bus)
 constexpr bool RA_LED_ENABLED = true;
 
 // USB Debug
-constexpr bool RA_USB_DEBUG_ENABLED = true;
+constexpr bool RA_USB_DEBUG_ENABLED = false;
 
 // Retain Deployment
 constexpr bool RA_RETAIN_DEPLOYMENT_ENABLED = false;
@@ -68,7 +68,7 @@ constexpr uint32_t RA_USB_WAIT_TIMEOUT_MS    = 3000ul;  // ms, wait for USB host
 /* LORA (EBYTE E22) SETTINGS */
 
 constexpr uint8_t  RA_LORA_NET_ID         = 0x00;
-constexpr uint32_t RA_LORA_AIR_DATA_RATE  = 2400ul;  // bps
+constexpr uint32_t RA_LORA_AIR_DATA_RATE  = 1200ul;  // bps
 constexpr uint8_t  RA_LORA_PACKET_LENGTH  = 240;     // bytes (max sub-packet)
 
 /* BOARD FEATURES */
